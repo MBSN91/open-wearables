@@ -1054,10 +1054,18 @@ class Whoop247Data(Base247DataTemplate):
 
         score.kilojoule is the cycle's total energy expenditure; converted to
         kcal (1 kJ = 0.239 kcal, same factor as workouts.py) and stored as an
-        is_daily_total energy sample anchored at the cycle start. The cycle
-        start is stable across re-syncs, so the open cycle's growing total
-        upserts in place via the (source, series, recorded_at) conflict key
-        instead of accumulating duplicate rows.
+        is_daily_total energy sample.
+
+        Whoop cycles start at SLEEP ONSET (verified against sleep records:
+        cycle starts equal sleep start times), so the cycle covering waking
+        day D typically starts on the evening of D-1. Anchoring at the raw
+        start would bucket energy onto the wrong local date — and two cycles
+        can even collide on one date (onset after midnight + onset before the
+        next midnight). Anchor at start + 13h instead: for onsets between
+        18:00 and 06:00 local this always lands mid-waking-day. Derived from
+        start only, so it is stable across re-syncs and the open cycle's
+        growing total upserts in place via the (source, series, recorded_at)
+        conflict key instead of accumulating duplicate rows.
         """
         samples: list[TimeSeriesSampleCreate] = []
         for raw in raw_cycles:
@@ -1066,10 +1074,10 @@ class Whoop247Data(Base247DataTemplate):
             score = raw.get("score") or {}
             kilojoule = score.get("kilojoule")
             start = raw.get("start")
-            if kilojoule is None or not start:
+            if kilojoule is None or kilojoule <= 0 or not start:
                 continue
             try:
-                recorded_at = datetime.fromisoformat(str(start).replace("Z", "+00:00"))
+                recorded_at = datetime.fromisoformat(str(start).replace("Z", "+00:00")) + timedelta(hours=13)
                 samples.append(
                     TimeSeriesSampleCreate(
                         id=uuid4(),
