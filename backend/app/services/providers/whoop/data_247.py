@@ -504,6 +504,19 @@ class Whoop247Data(Base247DataTemplate):
                 user_id=str(user_id),
             )
 
+        try:
+            results["daily_energy_samples_synced"] = self.load_and_save_cycles(db, user_id, start_time, end_time)
+        except Exception as e:
+            db.rollback()
+            log_structured(
+                self.logger,
+                "error",
+                f"Failed to sync cycle data: {e}",
+                provider="whoop",
+                task="load_and_save_all",
+                user_id=str(user_id),
+            )
+
         return results
 
     # -------------------------------------------------------------------------
@@ -958,7 +971,7 @@ class Whoop247Data(Base247DataTemplate):
         return {}
 
     # -------------------------------------------------------------------------
-    # Daily Activity Statistics
+    # Daily Activity Statistics - Whoop /v2/cycle (day energy expenditure)
     # -------------------------------------------------------------------------
 
     def get_daily_activity_statistics(
@@ -968,13 +981,134 @@ class Whoop247Data(Base247DataTemplate):
         start_date: datetime,
         end_date: datetime,
     ) -> list[dict[str, Any]]:
-        """Fetch aggregated daily activity statistics."""
-        return []
+        """Fetch physiological cycles (Whoop "days") via /v2/cycle with pagination.
 
-    def normalize_daily_activity(
+        Each SCORED cycle carries the day's total energy expenditure
+        (score.kilojoule) and day strain. The current (open) cycle is included,
+        so re-syncs refresh today's running total.
+        """
+        all_cycles: list[dict[str, Any]] = []
+        next_token = None
+        max_limit = 25  # Whoop API limit
+
+        start_iso = start_date.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        end_iso = end_date.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        while True:
+            params: dict[str, Any] = {
+                "start": start_iso,
+                "end": end_iso,
+                "limit": max_limit,
+            }
+
+            if next_token:
+                params["nextToken"] = next_token
+
+            try:
+                response = self._make_api_request(db, user_id, "/v2/cycle", params=params)
+                store_raw_payload(
+                    source="api_response",
+                    provider="whoop",
+                    payload=response,
+                    user_id=str(user_id),
+                    trace_id="/v2/cycle",
+                )
+
+                records = response.get("records", []) if isinstance(response, dict) else []
+                all_cycles.extend(records)
+
+                next_token = response.get("next_token") if isinstance(response, dict) else None
+
+                if not records or not next_token:
+                    break
+
+            except Exception as e:
+                log_structured(
+                    self.logger,
+                    "error",
+                    f"Error fetching Whoop cycle data: {e}",
+                    provider="whoop",
+                    task="get_daily_activity_statistics",
+                    user_id=str(user_id),
+                )
+                if all_cycles:
+                    log_structured(
+                        self.logger,
+                        "warning",
+                        f"Returning partial cycle data due to error: {e}",
+                        provider="whoop",
+                        task="get_daily_activity_statistics",
+                        user_id=str(user_id),
+                    )
+                    break
+                raise
+
+        return all_cycles
+
+    def normalize_daily_activity(  # ty:ignore[invalid-method-override]
         self,
-        raw_stats: dict[str, Any],
+        raw_cycles: list[dict[str, Any]],
         user_id: UUID,
-    ) -> dict[str, Any]:
-        """Normalize daily activity statistics to our schema."""
-        return {}
+    ) -> list[TimeSeriesSampleCreate]:
+        """Normalize Whoop cycles into daily energy samples.
+
+        score.kilojoule is the cycle's total energy expenditure; converted to
+        kcal (1 kJ = 0.239 kcal, same factor as workouts.py) and stored as an
+        is_daily_total energy sample anchored at the cycle start. The cycle
+        start is stable across re-syncs, so the open cycle's growing total
+        upserts in place via the (source, series, recorded_at) conflict key
+        instead of accumulating duplicate rows.
+        """
+        samples: list[TimeSeriesSampleCreate] = []
+        for raw in raw_cycles:
+            if raw.get("score_state") != "SCORED":
+                continue
+            score = raw.get("score") or {}
+            kilojoule = score.get("kilojoule")
+            start = raw.get("start")
+            if kilojoule is None or not start:
+                continue
+            try:
+                recorded_at = datetime.fromisoformat(str(start).replace("Z", "+00:00"))
+                samples.append(
+                    TimeSeriesSampleCreate(
+                        id=uuid4(),
+                        user_id=user_id,
+                        provider=ProviderName.WHOOP,
+                        source=self.provider_name,
+                        recorded_at=recorded_at,
+                        zone_offset=raw.get("timezone_offset"),
+                        value=Decimal(str(kilojoule)) * Decimal("0.239"),
+                        series_type=SeriesType.energy,
+                        is_daily_total=True,
+                    )
+                )
+            except Exception as e:
+                log_structured(
+                    self.logger,
+                    "warning",
+                    f"Skipping malformed cycle record: {e}",
+                    provider="whoop",
+                    task="normalize_daily_activity",
+                    user_id=str(user_id),
+                )
+        return samples
+
+    def load_and_save_cycles(
+        self,
+        db: DbSession,
+        user_id: UUID,
+        start_time: datetime,
+        end_time: datetime,
+    ) -> int:
+        """Fetch cycles and save daily energy samples.
+
+        Returns the number of rows written (inserted + updated in place).
+        """
+        raw_data = self.get_daily_activity_statistics(db, user_id, start_time, end_time)
+        samples = self.normalize_daily_activity(raw_data, user_id)
+        if not samples:
+            return 0
+        counts = timeseries_service.bulk_create_samples(db, samples)
+        db.commit()
+        return getattr(counts, "inserted", 0) + getattr(counts, "updated", 0)
